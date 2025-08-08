@@ -70,6 +70,7 @@ def guardar_en_hoja(resultados, fecha_objetivo):
         print("📄 No hay nuevas licitaciones para agregar (todas ya existen en la hoja).")
         return
 
+    # Mapeo a las columnas finales
     df_nuevo["Número"] = range(ultimo_numero + 1, ultimo_numero + 1 + len(df_nuevo))
     df_nuevo["FyH Extracción"] = df_nuevo["fecha_extraccion"]
     df_nuevo["FyH Publicación"] = df_nuevo["fecha_publicacion"]
@@ -86,26 +87,29 @@ def guardar_en_hoja(resultados, fecha_objetivo):
 
     df_nuevo = df_nuevo[columnas_ordenadas]
 
-    # Calcula la fila donde empiezan los datos nuevos
+    # Empieza a escribir después de la última fila existente (1 de encabezado)
     start_row = len(data_existente) + 2
     hoja.append_rows(df_nuevo.values.tolist(), value_input_option="USER_ENTERED")
 
-    # Formato verde claro 2 y rojo claro 2
+    # Formatos
     verde_claro = {"backgroundColor": {"red": 0.8, "green": 1.0, "blue": 0.8}}
     rojo_claro  = {"backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}}
 
     # Columnas a formatear y su índice (1-based)
     cols = {
-        "Monto":      columnas_ordenadas.index("Monto") + 1,
-        "Tipo Monto": columnas_ordenadas.index("Tipo Monto") + 1,
-        "FyH TERRENO":columnas_ordenadas.index("FyH TERRENO") + 1,
-        "OBLIG?":     columnas_ordenadas.index("OBLIG?") + 1
+        "Monto":       columnas_ordenadas.index("Monto") + 1,
+        "Tipo Monto":  columnas_ordenadas.index("Tipo Monto") + 1,
+        "FyH TERRENO": columnas_ordenadas.index("FyH TERRENO") + 1,
+        "OBLIG?":      columnas_ordenadas.index("OBLIG?") + 1
     }
 
-    for i, fila in enumerate(df_nuevo.itertuples(index=False), start=start_row):
-        for nombre, col_idx in cols.items():
-            valor = getattr(fila, nombre.replace(" ", "_").lower())
-            celda = rowcol_to_a1(i, col_idx)
-            hoja.format(celda, verde_claro if valor and valor != "NF" else rojo_claro)
+    # Acceso robusto por índice de columna (evita problemas de mayúsculas/espacios)
+    col_idx_cache = {nombre: df_nuevo.columns.get_loc(nombre) for nombre in cols.keys()}
+
+    for r, row in enumerate(df_nuevo.itertuples(index=False, name=None), start=start_row):
+        for nombre, col_sheet in cols.items():
+            val = row[col_idx_cache[nombre]]
+            celda = rowcol_to_a1(r, col_sheet)
+            hoja.format(celda, verde_claro if (val not in (None, "", "NF")) else rojo_claro)
 
     print(f"✅ {len(df_nuevo)} nuevas licitaciones guardadas en la hoja '{mes}'")
