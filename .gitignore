@@ -1,0 +1,29 @@
+# Archivos de Python
+__pycache__/
+*.pyc
+
+# Entornos virtuales
+.venv/
+env/
+venv/
+
+# Configuraciones de entorno
+.env
+
+# Claves y credenciales
+service_account.json
+
+# Binarios del navegador
+chromedriver.exe
+chromedriver.log
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Archivos temporales
+*.log
+*.bak
+
+# Archivos de VSCode (si no quieres subir tu configuración personal)
+.vscode/
