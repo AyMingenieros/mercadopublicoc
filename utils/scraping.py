@@ -1,194 +1,180 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from oauth2client.service_account import ServiceAccountCredentials
-import gspread
-from selenium.webdriver.support import expected_conditions as EC
-from datetime import datetime
-from utils.sheets import conectar_google_sheets 
-import time
+# utils/sheets.py
 import os
 import json
+from datetime import datetime
 
-BASE_URL = "https://www.mercadopublico.cl/BuscarLicitacion"
+import gspread
+from gspread.utils import rowcol_to_a1
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+
 SPREADSHEET_ID = "1TqiNXXAgfKlSu2b_Yr9r6AdQU_WacdROsuhcHL0i6Mk"
 
-
-
-R_COMMIT = True
-
+# =========================
+# Conexión
+# =========================
 def conectar_google_sheets():
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
     ]
-
-    # Producción: lee el JSON desde la variable de entorno
     if "GCP_SERVICE_ACCOUNT_KEY" in os.environ:
         creds_dict = json.loads(os.environ["GCP_SERVICE_ACCOUNT_KEY"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     else:
-        # Local: usa el fichero service_account.json
         creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
 
     client = gspread.authorize(creds)
     print("✅ Conexión con Google Sheets exitosa")
     return client.open_by_key(SPREADSHEET_ID)
 
+# =========================
+# Utilidades de encabezados
+# =========================
+def _normaliza(s: str) -> str:
+    return (s or "").strip().lower() \
+        .replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u") \
+        .replace("ñ","n")
 
+def _encabezado_idx(headers, candidatos):
+    norm_headers = [_normaliza(h) for h in headers]
+    for cand in candidatos:
+        c = _normaliza(cand)
+        for i, h in enumerate(norm_headers):
+            if h == c:
+                return i
+    return None
 
+def _asegurar_encabezados(hoja, esperados):
+    headers_actuales = hoja.row_values(1)
+    if not headers_actuales:
+        hoja.update('A1', [esperados])
+        return esperados
+    faltantes = [h for h in esperados if h not in headers_actuales]
+    if faltantes:
+        nuevos = headers_actuales + faltantes
+        hoja.update('A1', [nuevos])
+        return nuevos
+    return headers_actuales
 
-
-def cargar_palabras_clave(sheet):
-    try:
-        hoja = sheet.worksheet("Palabras Clave")
-        # Lee desde la celda B9 hacia abajo
-        palabras_raw = hoja.col_values(2)[8:]  # Índice 8 porque empieza desde fila 9 (0-based)
-        palabras_clave = [p.strip() for p in palabras_raw if p.strip()]
-        print(f"🔑 {len(palabras_clave)} palabras clave cargadas desde Google Sheets.")
-        return palabras_clave
-    except Exception as e:
-        print(f"❌ Error al cargar palabras clave: {e}")
-        return []
-
-
-def iniciar_driver():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1920,1080")
-    return webdriver.Chrome(options=options)
-
-def buscar_y_extraer(driver, palabra, fecha_objetivo):
-    print(f"\U0001F50D Buscando: {palabra}")
-    resultados = []
-
-    try:
-        driver.get(BASE_URL)
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "textoBusqueda")))
-        input_busqueda = driver.find_element(By.ID, "textoBusqueda")
-        input_busqueda.clear()
-        input_busqueda.send_keys(palabra)
-        input_busqueda.send_keys(Keys.ENTER)
-
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CLASS_NAME, "lic-block-body")))
-        time.sleep(2)
-
-        tarjetas = driver.find_elements(By.CLASS_NAME, "lic-block-body")
-
-        for tarjeta in tarjetas:
+def _ultimo_numero(hoja, headers):
+    # Soporta nombres alternos de la columna Número
+    candidatos = ["Número","Numero","N°","Nro","#","Num","No."]
+    idx = _encabezado_idx(headers, candidatos)
+    if idx is None:
+        return 0
+    valores = hoja.col_values(idx + 1)[1:]  # omite encabezado
+    nums = []
+    for v in valores:
+        v = (v or "").strip()
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if digits:
             try:
-                onclick = tarjeta.find_element(By.CSS_SELECTOR, "a").get_attribute("onclick")
-                if "DetailsAcquisition.aspx?" not in onclick:
-                    continue
+                n = int(digits)
+                if n > 0:
+                    nums.append(n)
+            except:
+                pass
+    return max(nums) if nums else 0
 
-                start = onclick.find("DetailsAcquisition.aspx?")
-                qs = onclick[start:].split("'")[0]
-                link_ficha = "https://www.mercadopublico.cl/Procurement/Modules/RFB/" + qs
-                id_real = qs.split("idlicitacion=")[-1].strip()
+def _ids_existentes(hoja, headers):
+    idx = _encabezado_idx(headers, ["ID","Id","id"])
+    if idx is None:
+        return set()
+    vals = hoja.col_values(idx + 1)[1:]
+    return set((v or "").strip() for v in vals if (v or "").strip())
 
-                if not any(tipo in id_real for tipo in ["LE", "LP", "LQ", "LR"]):
-                    continue
+# =========================
+# Guardado robusto
+# =========================
+def guardar_en_hoja(resultados, fecha_objetivo: str):
+    """
+    Escribe resultados en la hoja del mes correspondiente.
+    - Crea/completa encabezados si faltan.
+    - Calcula el consecutivo aunque la columna no se llame exactamente "Número".
+    - Deduplica por ID.
+    - Aplica formato simple a columnas clave.
+    """
+    if not resultados:
+        print("⚠️ No hay resultados para guardar.")
+        return
 
-                if "LE" in id_real:
-                    tipo = "100-1000 UTM"
-                elif "LP" in id_real:
-                    tipo = "1000-2000 UTM"
-                elif "LQ" in id_real:
-                    tipo = "2000-5000 UTM"
-                elif "LR" in id_real:
-                    tipo = "5000+ UTM"
-                else:
-                    tipo = ""
+    # Nombre de la pestaña (mes)
+    mes = datetime.strptime(fecha_objetivo, "%Y-%m-%d").strftime("%B").capitalize()
+    sheet = conectar_google_sheets()
 
-                driver.execute_script("window.open(arguments[0]);", link_ficha)
-                driver.switch_to.window(driver.window_handles[1])
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                time.sleep(2)
+    # Orden/nombres canónicos a usar en la hoja
+    columnas_ordenadas = [
+        "Número", "FyH Extracción", "FyH Publicación", "ID", "Título",
+        "Descripción", "Tipo", "Monto", "Tipo Monto",
+        "LINK FICHA", "FyH TERRENO", "OBLIG?", "FyH CIERRE"
+    ]
 
-                try:
-                    titulo = driver.find_element(By.ID, "lblNombreLicitacion").text.strip()
-                except:
-                    titulo = ""
+    df_nuevo = pd.DataFrame(resultados)
 
-                try:
-                    descripcion = driver.find_element(By.ID, "lblFicha1Descripcion").text.strip()
-                except:
-                    descripcion = ""
+    # Abre o crea la pestaña del mes con encabezados
+    try:
+        hoja = sheet.worksheet(mes)
+    except gspread.exceptions.WorksheetNotFound:
+        hoja = sheet.add_worksheet(title=mes, rows="1000", cols="20")
+        hoja.update('A1', [columnas_ordenadas])
 
-                try:
-                    fecha_publicacion = driver.find_element(By.ID, "lblFicha3Publicacion").text.strip()
-                except:
-                    fecha_publicacion = ""
+    headers = _asegurar_encabezados(hoja, columnas_ordenadas)
+    ultimo = _ultimo_numero(hoja, headers)
+    ids_exist = _ids_existentes(hoja, headers)
 
-                try:
-                    fecha_cierre = driver.find_element(By.ID, "lblFicha3Cierre").text.strip()
-                except:
-                    fecha_cierre = ""
+    # Deduplicación por ID
+    if "id" in df_nuevo.columns:
+        df_nuevo = df_nuevo[~df_nuevo["id"].isin(ids_exist)]
+    else:
+        print("⚠️ No se encontró la columna 'id' en resultados. No se puede deduplicar.")
 
-                try:
-                    fecha_apertura = driver.find_element(By.ID, "lblFicha3ActoAperturaTecnica").text.strip()
-                except:
-                    fecha_apertura = ""
+    if df_nuevo.empty:
+        print("📄 No hay nuevas licitaciones para agregar (todas ya existen en la hoja).")
+        return
 
-                try:
-                    obligatoria = driver.find_element(By.ID, "grvFechasUsuario_ctl02_lblFicha3TituloFechaUsuario").text.strip() or "NF"
-                    fecha_visita = driver.find_element(By.ID, "grvFechasUsuario_ctl02_lblFicha3FechaUsuario").text.strip() or "ok"
-                except Exception:
-                    obligatoria = "No encontrada en Ficha"
-                    fecha_visita = "No disponible en ficha"
+    # Mapeo a columnas finales (usa .get para robustez)
+    df_nuevo = df_nuevo.copy()
+    df_nuevo["Número"]            = range(ultimo + 1, ultimo + 1 + len(df_nuevo))
+    df_nuevo["FyH Extracción"]    = df_nuevo.get("fecha_extraccion", "")
+    df_nuevo["FyH Publicación"]   = df_nuevo.get("fecha_publicacion", "")
+    df_nuevo["ID"]                = df_nuevo.get("id", "")
+    df_nuevo["Título"]            = df_nuevo.get("titulo", "")
+    df_nuevo["Descripción"]       = df_nuevo.get("descripcion", "")
+    df_nuevo["Tipo"]              = df_nuevo.get("tipo", "")
+    df_nuevo["Monto"]             = df_nuevo.get("monto", "")
+    df_nuevo["Tipo Monto"]        = df_nuevo.get("tipo_monto", "")
+    df_nuevo["LINK FICHA"]        = df_nuevo.get("link_ficha", "")
+    df_nuevo["FyH TERRENO"]       = df_nuevo.get("fecha_visita", "")
+    df_nuevo["OBLIG?"]            = df_nuevo.get("visita_obligatoria", "")
+    df_nuevo["FyH CIERRE"]        = df_nuevo.get("fecha_cierre", "")
 
-                    
+    # Asegura todas las columnas y reordena
+    for col in columnas_ordenadas:
+        if col not in df_nuevo.columns:
+            df_nuevo[col] = ""
+    df_nuevo = df_nuevo[columnas_ordenadas]
 
-                try:
-                    tipo_monto = driver.find_element(By.ID, "lblFicha7TituloMontoEstimado").text.strip()
-                except:
-                    tipo_monto = "NO PUBLICO"
+    # Append
+    hoja.append_rows(df_nuevo.values.tolist(), value_input_option="USER_ENTERED")
 
-                try:
-                    monto = driver.find_element(By.ID, "lblFicha7MontoEstimado").text.strip()
-                except:
-                    monto = "NF"
+    # Formato (verde si hay valor distinto de NF, rojo si vacío o NF)
+    verde = {"backgroundColor": {"red": 0.8, "green": 1.0, "blue": 0.8}}
+    rojo  = {"backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}}
+    cols_format = ["Monto", "Tipo Monto", "FyH TERRENO", "OBLIG?"]
 
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
+    # Calcula rango de filas recién agregadas
+    total_vals = hoja.get_all_values()
+    end_row = len(total_vals)            # última fila con datos (1-based)
+    n = len(df_nuevo)                    # filas nuevas agregadas
+    start_row = end_row - n + 1          # primera fila nueva
 
-                resultados.append({
-                    "palabra": palabra,
-                    "fecha_extraccion": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "fecha_publicacion": fecha_publicacion,
-                    "id": id_real,
-                    "titulo": titulo,
-                    "descripcion": descripcion,
-                    "tipo": tipo,
-                    "monto": monto,
-                    "tipo_monto": tipo_monto,
-                    "link_ficha": link_ficha,
-                    "fecha_visita": fecha_visita,
-                    "visita_obligatoria": obligatoria,
-                    "fecha_cierre": fecha_cierre,
-                    "fecha_apertura": fecha_apertura
-                })
+    for nombre in cols_format:
+        c_idx = columnas_ordenadas.index(nombre) + 1  # 1-based
+        # Aplica formato celda por celda (simple y seguro)
+        for r in range(start_row, end_row + 1):
+            celda = rowcol_to_a1(r, c_idx)
+            val = hoja.acell(celda).value or ""
+            hoja.format(celda, verde if (val.strip() and val.strip() != "NF") else rojo)
 
-            except Exception as e:
-                print(f"⚠️ Error en tarjeta individual: {e}")
-
-    except Exception as e:
-        print(f"❌ Error general en búsqueda: {e}")
-
-    return resultados
-
-def ejecutar_scraping(fecha_objetivo, palabras):
-    driver = iniciar_driver()
-    resultados_totales = []
-
-    for palabra in palabras:
-        resultados = buscar_y_extraer(driver, palabra, fecha_objetivo)
-        resultados_totales.extend(resultados)
-
-    driver.quit()
-    return resultados_totales
-
+    print(f"✅ {len(df_nuevo)} nuevas licitaciones guardadas en la hoja '{mes}'")
