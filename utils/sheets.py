@@ -4,7 +4,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 from datetime import datetime
-from gspread.utils import rowcol_to_a1  # para convertir índices a A1
 
 SPREADSHEET_ID = "1TqiNXXAgfKlSu2b_Yr9r6AdQU_WacdROsuhcHL0i6Mk"
 
@@ -37,7 +36,69 @@ def cargar_palabras_clave(sheet):
         return []
 
 
+# =========================
+# Helpers robustos de hoja
+# =========================
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()\
+        .replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")\
+        .replace("ñ","n").replace("°","")
+
+def _find_header_idx(headers, candidatos):
+    H = [_norm(h) for h in headers]
+    for cand in candidatos:
+        c = _norm(cand)
+        for i, h in enumerate(H):
+            if h == c:
+                return i
+    return None
+
+def _asegurar_encabezados(hoja, esperados):
+    headers = hoja.row_values(1)
+    if not headers:
+        hoja.update('A1', [esperados])
+        return esperados
+    # agrega faltantes al final SIN borrar los existentes
+    faltantes = [h for h in esperados if h not in headers]
+    if faltantes:
+        nuevos = headers + faltantes
+        hoja.update('A1', [nuevos])
+        return nuevos
+    return headers
+
+def _ultimo_numero(hoja, headers):
+    idx = _find_header_idx(headers, ["Número","Numero","N°","Nro","#","Num","No."])
+    if idx is None:
+        return 0
+    vals = hoja.col_values(idx+1)[1:]  # sin encabezado
+    nums = []
+    for v in vals:
+        v = (v or "").strip()
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if digits:
+            try:
+                n = int(digits)
+                if n > 0: nums.append(n)
+            except:
+                pass
+    return max(nums) if nums else 0
+
+def _ids_existentes(hoja, headers):
+    idx = _find_header_idx(headers, ["ID","Id","id"])
+    if idx is None:
+        return set()
+    vals = hoja.col_values(idx+1)[1:]
+    return set((v or "").strip() for v in vals if (v or "").strip())
+
+
 def guardar_en_hoja(resultados, fecha_objetivo):
+    """
+    Apila resultados en la pestaña del mes (August, September, ...).
+    - Crea encabezados si faltan.
+    - Tolera 'Número'/'N°' y variantes.
+    - Deduplica por 'ID'.
+    - Evita 429 quitando formateo por-celda (solo append).
+    """
     if not resultados:
         print("⚠️ No hay resultados para guardar.")
         return
@@ -51,65 +112,58 @@ def guardar_en_hoja(resultados, fecha_objetivo):
         "LINK FICHA", "FyH TERRENO", "OBLIG?", "FyH CIERRE"
     ]
 
-    df_nuevo = pd.DataFrame(resultados)
+    df = pd.DataFrame(resultados)
 
+    # abrir o crear pestaña del mes
     try:
         hoja = sheet.worksheet(mes)
-        data_existente = hoja.get_all_records()
     except gspread.exceptions.WorksheetNotFound:
         hoja = sheet.add_worksheet(title=mes, rows="1000", cols="20")
-        hoja.append_row(columnas_ordenadas)
-        data_existente = []
+        hoja.update('A1', [columnas_ordenadas])
 
-    ultimo_numero = int(data_existente[-1]["Número"]) if data_existente else 0
-    ids_existentes = set(row["ID"] for row in data_existente)
+    # asegurar encabezados
+    headers = _asegurar_encabezados(hoja, columnas_ordenadas)
 
-    df_nuevo = df_nuevo[~df_nuevo["id"].isin(ids_existentes)]
+    # leer último consecutivo y IDs ya guardados (para APILAR sin duplicar)
+    ultimo = _ultimo_numero(hoja, headers)
+    ids_guardados = _ids_existentes(hoja, headers)
 
-    if df_nuevo.empty:
+    # filtrar duplicados por ID
+    if "id" in df.columns:
+        df = df[~df["id"].isin(ids_guardados)]
+
+    if df.empty:
         print("📄 No hay nuevas licitaciones para agregar (todas ya existen en la hoja).")
         return
 
-    # Mapeo a las columnas finales
-    df_nuevo["Número"] = range(ultimo_numero + 1, ultimo_numero + 1 + len(df_nuevo))
-    df_nuevo["FyH Extracción"] = df_nuevo["fecha_extraccion"]
-    df_nuevo["FyH Publicación"] = df_nuevo["fecha_publicacion"]
-    df_nuevo["ID"] = df_nuevo["id"]
-    df_nuevo["Título"] = df_nuevo["titulo"]
-    df_nuevo["Descripción"] = df_nuevo["descripcion"]
-    df_nuevo["Tipo"] = df_nuevo["tipo"]
-    df_nuevo["Monto"] = df_nuevo["monto"]
-    df_nuevo["Tipo Monto"] = df_nuevo["tipo_monto"]
-    df_nuevo["LINK FICHA"] = df_nuevo["link_ficha"]
-    df_nuevo["FyH TERRENO"] = df_nuevo["fecha_visita"]
-    df_nuevo["OBLIG?"] = df_nuevo["visita_obligatoria"]
-    df_nuevo["FyH CIERRE"] = df_nuevo["fecha_cierre"]
+    # mapear a columnas finales
+    df_out = pd.DataFrame()
+    df_out["Número"]           = range(ultimo + 1, ultimo + 1 + len(df))
+    df_out["FyH Extracción"]   = df.get("fecha_extraccion", "")
+    df_out["FyH Publicación"]  = df.get("fecha_publicacion", "")
+    df_out["ID"]               = df.get("id", "")
+    df_out["Título"]           = df.get("titulo", "")
+    df_out["Descripción"]      = df.get("descripcion", "")
+    df_out["Tipo"]             = df.get("tipo", "")
+    df_out["Monto"]            = df.get("monto", "")
+    df_out["Tipo Monto"]       = df.get("tipo_monto", "")
+    df_out["LINK FICHA"]       = df.get("link_ficha", "")
+    df_out["FyH TERRENO"]      = df.get("fecha_visita", "")
+    df_out["OBLIG?"]           = df.get("visita_obligatoria", "")
+    df_out["FyH CIERRE"]       = df.get("fecha_cierre", "")
 
-    df_nuevo = df_nuevo[columnas_ordenadas]
+    # asegurar orden exacto
+    for col in columnas_ordenadas:
+        if col not in df_out.columns:
+            df_out[col] = ""
+    df_out = df_out[columnas_ordenadas]
 
-    # Empieza a escribir después de la última fila existente (1 de encabezado)
-    start_row = len(data_existente) + 2
-    hoja.append_rows(df_nuevo.values.tolist(), value_input_option="USER_ENTERED")
+    # append (apilar)
+    hoja.append_rows(df_out.values.tolist(), value_input_option="USER_ENTERED")
 
-    # Formatos
-    verde_claro = {"backgroundColor": {"red": 0.8, "green": 1.0, "blue": 0.8}}
-    rojo_claro  = {"backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}}
+    # IMPORTANTE: quitamos formateo por-celda para no exceder cuotas (429).
+    # Si quieres colores automáticos, configura reglas de formato condicional manualmente
+    # o agrega una función de "aplicar_formato_condicional" que se ejecute SOLO cuando
+    # se cree la pestaña (1 batch de reglas, sin tocar cada fila).
 
-    # Columnas a formatear y su índice (1-based)
-    cols = {
-        "Monto":       columnas_ordenadas.index("Monto") + 1,
-        "Tipo Monto":  columnas_ordenadas.index("Tipo Monto") + 1,
-        "FyH TERRENO": columnas_ordenadas.index("FyH TERRENO") + 1,
-        "OBLIG?":      columnas_ordenadas.index("OBLIG?") + 1
-    }
-
-    # Acceso robusto por índice de columna (evita problemas de mayúsculas/espacios)
-    col_idx_cache = {nombre: df_nuevo.columns.get_loc(nombre) for nombre in cols.keys()}
-
-    for r, row in enumerate(df_nuevo.itertuples(index=False, name=None), start=start_row):
-        for nombre, col_sheet in cols.items():
-            val = row[col_idx_cache[nombre]]
-            celda = rowcol_to_a1(r, col_sheet)
-            hoja.format(celda, verde_claro if (val not in (None, "", "NF")) else rojo_claro)
-
-    print(f"✅ {len(df_nuevo)} nuevas licitaciones guardadas en la hoja '{mes}'")
+    print(f"✅ {len(df_out)} nuevas licitaciones guardadas en la hoja '{mes}'")
